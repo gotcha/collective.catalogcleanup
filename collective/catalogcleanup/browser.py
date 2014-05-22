@@ -21,6 +21,7 @@ def path_len(item):
 class Cleanup(BrowserView):
 
     def __call__(self, dry_run=None):
+        self.notfound = {}
         self.messages = []
         self.msg("Starting catalog cleanup.")
         # Determine whether this is a dry run or not.  We are very
@@ -55,11 +56,29 @@ class Cleanup(BrowserView):
             if catalog_id == 'reference_catalog':
                 problems += self.check_references()
             problems += self.non_unique_uids(catalog_id)
+            problems += self.clean_notfound(catalog_id)
             self.msg("%s: total problems: %d", catalog_id, problems)
 
         self.newline()
         self.msg("Done with catalog cleanup.")
         return '\n'.join(self.messages)
+
+    def clean_notfound(self, catalog_id):
+        notfound = self.notfound.setdefault(catalog_id, set())
+        self.msg("%s: unindexed %d not found.", catalog_id, len(notfound))
+        if not self.dry_run:
+            context = aq_inner(self.context)
+            catalog = getToolByName(context, catalog_id)
+            indexes = catalog._catalog.indexes.values()
+            for rid in self.notfound[catalog_id]:
+                self.msg(
+                    "Indexed for %s: %s",
+                    rid,
+                    catalog._catalog.getIndexDataForRID(rid)
+                )
+                for index in indexes:
+                    index.unindex_object(rid)
+        return len(notfound)
 
     def msg(self, msg, *args, **kwargs):
         msg = msg % args
@@ -92,6 +111,10 @@ class Cleanup(BrowserView):
             return 1
         return 0
 
+    def store_notfound(self, catalog_id, brain):
+        notfound = self.notfound.setdefault(catalog_id, set())
+        notfound.add(brain.getRID())
+
     def remove_without_uids(self, catalog_id):
         """Remove all brains without UID.
         """
@@ -108,11 +131,14 @@ class Cleanup(BrowserView):
                 try:
                     path = brain.getPath()
                 except KeyError:
+                    self.store_notfound(catalog_id, brain)
                     continue
                 catalog.uncatalog_object(path)
             uncatalog += 1
-        self.msg("%s: removed %d brains without UID.",
-            catalog_id, uncatalog)
+        self.msg(
+            "%s: removed %d brains without UID.",
+            catalog_id, uncatalog
+        )
         return uncatalog
 
     def remove_without_object(self, catalog_id):
@@ -123,10 +149,17 @@ class Cleanup(BrowserView):
         status = {}
         standard_filter = {'Language': 'all'}
         brains = list(catalog(**standard_filter))
+        self.msg("%s: %d brains.", catalog_id, len(brains))
         for brain in brains:
             obj = self.get_object_or_status(brain)
             if not isinstance(obj, basestring):
                 continue
+            if obj == 'notfound':
+                try:
+                    path = brain.getPath()
+                except KeyError:
+                    self.store_notfound(catalog_id, brain)
+                    continue
             if not self.dry_run:
                 try:
                     path = brain.getPath()
@@ -166,6 +199,12 @@ class Cleanup(BrowserView):
                 obj = self.get_object_or_status(ref, getter)
                 if not isinstance(obj, basestring):
                     continue
+                if obj == 'notfound':
+                    try:
+                        path = brain.getPath()
+                    except KeyError:
+                        self.store_notfound(catalog_id, brain)
+                        continue
                 # We have an error.  Remove the reference brain.
                 count = status.get(obj, 0)
                 status[obj] = count + 1
